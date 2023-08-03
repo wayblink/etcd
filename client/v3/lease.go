@@ -221,6 +221,7 @@ func (l *lessor) Grant(ctx context.Context, ttl int64) (*LeaseGrantResponse, err
 			TTL:            resp.TTL,
 			Error:          resp.Error,
 		}
+		l.lg.Info("wayblink Grant", zap.Int64("leaseID", int64(resp.GetID())), zap.Int64("ttl", ttl), zap.String("error", resp.GetError()))
 		return gresp, nil
 	}
 	return nil, toErr(ctx, err)
@@ -264,6 +265,7 @@ func (l *lessor) Leases(ctx context.Context) (*LeaseLeasesResponse, error) {
 }
 
 func (l *lessor) KeepAlive(ctx context.Context, id LeaseID) (<-chan *LeaseKeepAliveResponse, error) {
+	l.lg.Info("wayblink KeepAlive", zap.Int64("leaseID", int64(id)))
 	ch := make(chan *LeaseKeepAliveResponse, LeaseResponseChSize)
 
 	l.mu.Lock()
@@ -272,6 +274,7 @@ func (l *lessor) KeepAlive(ctx context.Context, id LeaseID) (<-chan *LeaseKeepAl
 	case <-l.donec:
 		err := l.loopErr
 		l.mu.Unlock()
+		l.lg.Info("wayblink lessor donec is triggered")
 		close(ch)
 		return ch, ErrKeepAliveHalted{Reason: err}
 	default:
@@ -286,11 +289,17 @@ func (l *lessor) KeepAlive(ctx context.Context, id LeaseID) (<-chan *LeaseKeepAl
 			nextKeepAlive: time.Now(),
 			donec:         make(chan struct{}),
 		}
+		l.lg.Info("wayblink create fresh keep alive",
+			zap.Int64("id", int64(id)),
+			zap.Time("deadline", ka.deadline),
+			zap.Time("nextKeepAlive", ka.nextKeepAlive))
 		l.keepAlives[id] = ka
 	} else {
 		// add channel and context to existing keep alive
 		ka.ctxs = append(ka.ctxs, ctx)
 		ka.chs = append(ka.chs, ch)
+		l.lg.Info("add channel and context to existing keep alive",
+			zap.Int64("id", int64(id)))
 	}
 	l.mu.Unlock()
 
@@ -304,6 +313,7 @@ func (l *lessor) KeepAlive(ctx context.Context, id LeaseID) (<-chan *LeaseKeepAl
 }
 
 func (l *lessor) KeepAliveOnce(ctx context.Context, id LeaseID) (*LeaseKeepAliveResponse, error) {
+	l.lg.Info("wayblink KeepAliveOnce", zap.Int64("leaseID", int64(id)))
 	for {
 		resp, err := l.keepAliveOnce(ctx, id)
 		if err == nil {
@@ -312,6 +322,7 @@ func (l *lessor) KeepAliveOnce(ctx context.Context, id LeaseID) (*LeaseKeepAlive
 			}
 			return resp, err
 		}
+		l.lg.Warn("wayblink KeepAliveOnce err", zap.Int64("leaseID", int64(id)), zap.Error(err))
 		if isHaltErr(ctx, err) {
 			return nil, toErr(ctx, err)
 		}
@@ -329,8 +340,10 @@ func (l *lessor) Close() error {
 func (l *lessor) keepAliveCtxCloser(ctx context.Context, id LeaseID, donec <-chan struct{}) {
 	select {
 	case <-donec:
+		l.lg.Info("wayblink keepAliveCtxCloser donec", zap.Int64("leaseID", int64(id)))
 		return
 	case <-l.donec:
+		l.lg.Info("wayblink keepAliveCtxCloser l.donec", zap.Int64("leaseID", int64(id)))
 		return
 	case <-ctx.Done():
 	}
@@ -346,6 +359,7 @@ func (l *lessor) keepAliveCtxCloser(ctx context.Context, id LeaseID, donec <-cha
 	// close channel and remove context if still associated with keep alive
 	for i, c := range ka.ctxs {
 		if c == ctx {
+			l.lg.Info("wayblink close channel and remove context if still associated with keep alive", zap.Int64("leaseID", int64(id)))
 			close(ka.chs[i])
 			ka.ctxs = append(ka.ctxs[:i], ka.ctxs[i+1:]...)
 			ka.chs = append(ka.chs[:i], ka.chs[i+1:]...)
@@ -354,6 +368,7 @@ func (l *lessor) keepAliveCtxCloser(ctx context.Context, id LeaseID, donec <-cha
 	}
 	// remove if no one more listeners
 	if len(ka.chs) == 0 {
+		l.lg.Info("wayblink remove keepalives as there are no listeners", zap.Int64("leaseID", int64(id)))
 		delete(l.keepAlives, id)
 	}
 }
@@ -403,11 +418,13 @@ func (l *lessor) keepAliveOnce(ctx context.Context, id LeaseID) (karesp *LeaseKe
 
 	stream, err := l.remote.LeaseKeepAlive(cctx, l.callOpts...)
 	if err != nil {
+		l.lg.Warn("wayblink keepAliveOnce LeaseKeepAlive fail", zap.Int64("id", int64(id)), zap.Error(err))
 		return nil, toErr(ctx, err)
 	}
 
 	defer func() {
 		if err := stream.CloseSend(); err != nil {
+			l.lg.Warn("wayblink keepAliveOnce stream.CloseSend() fail", zap.Int64("id", int64(id)), zap.Error(err))
 			if ferr == nil {
 				ferr = toErr(ctx, err)
 			}
@@ -417,11 +434,13 @@ func (l *lessor) keepAliveOnce(ctx context.Context, id LeaseID) (karesp *LeaseKe
 
 	err = stream.Send(&pb.LeaseKeepAliveRequest{ID: int64(id)})
 	if err != nil {
+		l.lg.Warn("wayblink keepAliveOnce stream.Send() fail", zap.Int64("id", int64(id)), zap.Error(err))
 		return nil, toErr(ctx, err)
 	}
 
 	resp, rerr := stream.Recv()
 	if rerr != nil {
+		l.lg.Warn("wayblink keepAliveOnce stream.Recv() fail", zap.Int64("id", int64(id)), zap.Error(rerr))
 		return nil, toErr(ctx, rerr)
 	}
 
@@ -430,6 +449,7 @@ func (l *lessor) keepAliveOnce(ctx context.Context, id LeaseID) (karesp *LeaseKe
 		ID:             LeaseID(resp.ID),
 		TTL:            resp.TTL,
 	}
+	l.lg.Info("wayblink keepAliveOnce succeed", zap.Int64("id", resp.ID), zap.Int64("ttl", karesp.TTL))
 	return karesp, nil
 }
 
@@ -448,6 +468,7 @@ func (l *lessor) recvKeepAliveLoop() (gerr error) {
 	for {
 		stream, err := l.resetRecv()
 		if err != nil {
+			l.lg.Warn("wayblink lessor recvKeepAliveLoop resetRecv err", zap.Error(err))
 			if canceledByCaller(l.stopCtx, err) {
 				return err
 			}
@@ -456,6 +477,7 @@ func (l *lessor) recvKeepAliveLoop() (gerr error) {
 				resp, err := stream.Recv()
 				if err != nil {
 					if canceledByCaller(l.stopCtx, err) {
+						l.lg.Warn("wayblink lessor recvKeepAliveLoop stream.Recv", zap.Error(err))
 						return err
 					}
 
@@ -465,6 +487,7 @@ func (l *lessor) recvKeepAliveLoop() (gerr error) {
 					break
 				}
 
+				l.lg.Info("wayblink lessor call recvKeepAlive", zap.Int64("id", resp.GetID()))
 				l.recvKeepAlive(resp)
 			}
 		}
@@ -472,6 +495,7 @@ func (l *lessor) recvKeepAliveLoop() (gerr error) {
 		select {
 		case <-time.After(retryConnWait):
 		case <-l.stopCtx.Done():
+			l.lg.Info("wayblink recvKeepAliveLoop l.stopCtx.Done")
 			return l.stopCtx.Err()
 		}
 	}
@@ -482,6 +506,7 @@ func (l *lessor) resetRecv() (pb.Lease_LeaseKeepAliveClient, error) {
 	sctx, cancel := context.WithCancel(l.stopCtx)
 	stream, err := l.remote.LeaseKeepAlive(sctx, append(l.callOpts, withMax(0))...)
 	if err != nil {
+		l.lg.Warn("wayblink fail to create LeaseKeepAlive stream", zap.Error(err))
 		cancel()
 		return nil, err
 	}
@@ -506,17 +531,19 @@ func (l *lessor) recvKeepAlive(resp *pb.LeaseKeepAliveResponse) {
 		ID:             LeaseID(resp.ID),
 		TTL:            resp.TTL,
 	}
-
+	l.lg.Info("wayblink recvKeepAlive", zap.Int64("id", resp.GetID()), zap.Int64("ttl", resp.GetTTL()))
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	ka, ok := l.keepAlives[karesp.ID]
 	if !ok {
+		l.lg.Info("wayblink keepAlives not exist", zap.Int64("id", int64(karesp.ID)))
 		return
 	}
 
 	if karesp.TTL <= 0 {
 		// lease expired; close all keep alive channels
+		l.lg.Info("wayblink lease expired; close all keep alive channels", zap.Int64("id", resp.GetID()))
 		delete(l.keepAlives, karesp.ID)
 		ka.close()
 		return
@@ -525,6 +552,7 @@ func (l *lessor) recvKeepAlive(resp *pb.LeaseKeepAliveResponse) {
 	// send update to all channels
 	nextKeepAlive := time.Now().Add((time.Duration(karesp.TTL) * time.Second) / 3.0)
 	ka.deadline = time.Now().Add(time.Duration(karesp.TTL) * time.Second)
+	l.lg.Info("wayblink update lease", zap.Int64("id", resp.GetID()), zap.Time("nextKeepAlive", nextKeepAlive), zap.Time("deadline", ka.deadline))
 	for _, ch := range ka.chs {
 		select {
 		case ch <- karesp:
@@ -548,6 +576,7 @@ func (l *lessor) deadlineLoop() {
 		select {
 		case <-time.After(time.Second):
 		case <-l.donec:
+			l.lg.Info("wayblink deadlineLoop l.donec")
 			return
 		}
 		now := time.Now()
@@ -556,6 +585,7 @@ func (l *lessor) deadlineLoop() {
 			if ka.deadline.Before(now) {
 				// waited too long for response; lease may be expired
 				ka.close()
+				l.lg.Info("wayblink deadlineLoop delete keepAlives", zap.Int64("leaseID", int64(id)))
 				delete(l.keepAlives, id)
 			}
 		}
@@ -579,8 +609,10 @@ func (l *lessor) sendKeepAliveLoop(stream pb.Lease_LeaseKeepAliveClient) {
 
 		for _, id := range tosend {
 			r := &pb.LeaseKeepAliveRequest{ID: int64(id)}
+			l.lg.Info("wayblink send keep alive to stream", zap.Int64("leaseID", int64(id)))
 			if err := stream.Send(r); err != nil {
 				// TODO do something with this error?
+				l.lg.Warn("wayblink fail to send keep alive to stream", zap.Int64("leaseID", int64(id)), zap.Error(err))
 				return
 			}
 		}
@@ -588,10 +620,13 @@ func (l *lessor) sendKeepAliveLoop(stream pb.Lease_LeaseKeepAliveClient) {
 		select {
 		case <-time.After(retryConnWait):
 		case <-stream.Context().Done():
+			l.lg.Warn("wayblink sendKeepAliveLoop stream context done")
 			return
 		case <-l.donec:
+			l.lg.Warn("wayblink sendKeepAliveLoop l.donec")
 			return
 		case <-l.stopCtx.Done():
+			l.lg.Warn("wayblink sendKeepAliveLoop l.stopCtx.Done")
 			return
 		}
 	}
