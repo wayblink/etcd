@@ -596,12 +596,16 @@ func (l *lessor) deadlineLoop() {
 // sendKeepAliveLoop sends keep alive requests for the lifetime of the given stream.
 func (l *lessor) sendKeepAliveLoop(stream pb.Lease_LeaseKeepAliveClient) {
 	for {
+		l.lg.Info("wayblink start new keep alive circle")
 		var tosend []LeaseID
 
 		now := time.Now()
+		l.lg.Info("wayblink start new keep alive circle get lock")
 		l.mu.Lock()
+		l.lg.Info("wayblink start new keep alive circle get lock succeed")
 		for id, ka := range l.keepAlives {
 			if ka.nextKeepAlive.Before(now) {
+				l.lg.Info("wayblink keep alive loop add id to toSend", zap.Int64("id", int64(id)))
 				tosend = append(tosend, id)
 			}
 		}
